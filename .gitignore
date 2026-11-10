@@ -1,0 +1,12 @@
+# Secrets
+.env
+.env.*
+supabase/.env
+
+# Supabase CLI local state
+supabase/.temp/
+supabase/.branches/
+
+# Python
+__pycache__/
+*.pyc
