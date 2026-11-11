@@ -51,7 +51,7 @@ begin
                    'reference',  r.reference,
                    'full_name',  r.full_name,
                    'place_name', r.place_name,
-                   'times_text', r.
+                   'times_text', r.times_text
                  ),
       headers := jsonb_build_object('Content-Type', 'application/json'),
       timeout_milliseconds := 5000

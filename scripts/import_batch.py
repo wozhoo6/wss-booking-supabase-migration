@@ -9,12 +9,14 @@ from ../.env. Defaults to the local Supabase database started by `supabase start
 The target host is printed before anything is written.
 
 What it does:
-  1. Opens the SQLite file read-only and checks it has the scraper's four tables.
+  1. Opens the SQLite file read-only and checks it has the scraper's five tables
+     (including clinic_hours and the hours/description columns on clinic_addresses).
   2. Computes clinic_addresses.name_match (does the Google place name match the
      registered clinic, or a doctor linked to it?).
   3. Registers a batch in public.import_batches and fills the staging tables.
-  4. Calls public.import_batch(batch_id, dry_run), which validates, upserts
-     (fill blanks only) and returns the counts.
+  4. Calls public.import_batch(batch_id, dry_run), which validates, upserts and
+     returns the counts. Existing rows are filled where blank; hours, descriptions
+     and business_status are replaced only when the file's fetch date is newer.
 
 Requires: pip install "psycopg[binary]>=3.1"
 """
@@ -24,6 +26,7 @@ import difflib
 import hashlib
 import json
 import os
+import pathlib
 import re
 import sqlite3
 import sys
@@ -52,6 +55,11 @@ EXPECTED_COLUMNS = {
         "address_id", "clinic_id", "place_id", "place_name", "address", "lat", "lng", "phone",
         "website", "rating", "review_count", "business_status", "result_rank",
         "matches_registered", "search_query", "searched_at",
+        "hours_text", "hours_fetched_at", "description", "description_fetched_at",
+    },
+    "clinic_hours": {
+        "hour_id", "address_id", "day_of_week", "open_time", "close_day_of_week",
+        "close_time", "fetched_at",
     },
     "dermatologists": {
         "npi", "name", "address1", "address2", "city", "state", "zip", "phone",
@@ -131,11 +139,14 @@ def read_source(src):
         if s:
             surnames.setdefault(clinic_id, set()).add(s)
 
+    # Empty strings become NULL so "not fetched / nothing found" is one value.
     addresses = []
     for row in src.execute(
         """select address_id, clinic_id, place_id, place_name, address, lat, lng, phone, website,
                   rating, review_count, business_status, result_rank, matches_registered,
-                  search_query, searched_at
+                  search_query, searched_at,
+                  nullif(hours_text, ''), nullif(hours_fetched_at, ''),
+                  nullif(description, ''), nullif(description_fetched_at, '')
            from clinic_addresses"""
     ):
         clinic_id, place_name = row[1], row[3]
@@ -148,7 +159,11 @@ def read_source(src):
     assignments = src.execute(
         "select npi, clinic_id, confidence, derm_name, clinic_name from assignments"
     ).fetchall()
-    return clinics, addresses, dermatologists, assignments
+    hours = src.execute(
+        """select hour_id, address_id, day_of_week, open_time, close_day_of_week, close_time, fetched_at
+           from clinic_hours"""
+    ).fetchall()
+    return clinics, addresses, dermatologists, assignments, hours
 
 
 def main():
@@ -161,14 +176,21 @@ def main():
 
     region = args.region.upper()
     path = os.path.abspath(args.source)
-    src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    if not os.path.isfile(path):
+        sys.exit(f"Source file not found: {path}")
+    # as_uri() builds a valid file: URI on Windows too (drive letter, backslashes, spaces).
+    src = sqlite3.connect(f"{pathlib.Path(path).as_uri()}?mode=ro", uri=True)
     check_schema(src)
-    clinics, addresses, dermatologists, assignments = read_source(src)
+    clinics, addresses, dermatologists, assignments, hours = read_source(src)
     src.close()
 
     matched = sum(1 for a in addresses if a[-1])
+    with_hours = sum(1 for a in addresses if a[16])        # hours_text
+    with_desc = sum(1 for a in addresses if a[18])         # description
     print(f"Read {len(clinics)} clinics, {len(addresses)} Google rows ({matched} name matches), "
           f"{len(dermatologists)} doctors, {len(assignments)} assignments.")
+    print(f"Hours: {len(hours)} open periods, {with_hours} addresses with hours text. "
+          f"Descriptions: {with_desc} addresses.")
 
     load_env_file()
     db_url = os.environ.get("SUPABASE_DB_URL", DEFAULT_DB_URL)
@@ -193,9 +215,18 @@ def main():
                 """insert into staging.stg_clinic_addresses
                    (batch_id, src_address_id, src_clinic_id, place_id, place_name, address, lat, lng,
                     phone, website, rating, review_count, business_status, result_rank,
-                    matches_registered, search_query, searched_at, name_match)
-                   values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                    matches_registered, search_query, searched_at, hours_text, hours_fetched_at,
+                    description, description_fetched_at, name_match)
+                   values (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                           %s, %s, %s, %s)""",
                 [(batch_id, *r) for r in addresses],
+            )
+            cur.executemany(
+                """insert into staging.stg_clinic_hours
+                   (batch_id, src_hour_id, src_address_id, day_of_week, open_time,
+                    close_day_of_week, close_time, fetched_at)
+                   values (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                [(batch_id, *r) for r in hours],
             )
             cur.executemany(
                 """insert into staging.stg_dermatologists
@@ -223,7 +254,8 @@ def main():
                     "update public.import_batches set status = 'failed', notes = %s where batch_id = %s",
                     (str(exc).strip()[:2000], batch_id),
                 )
-                for table in ("stg_assignments", "stg_clinic_addresses", "stg_dermatologists", "stg_clinics"):
+                for table in ("stg_clinic_hours", "stg_assignments", "stg_clinic_addresses",
+                              "stg_dermatologists", "stg_clinics"):
                     cur.execute(f"delete from staging.{table} where batch_id = %s", (batch_id,))
             conn.commit()
             sys.exit(f"Batch {batch_id} failed: {exc}")
