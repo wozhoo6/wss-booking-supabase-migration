@@ -398,6 +398,11 @@ deno_version = 2
 [functions.clinic-redirect]
 verify_jwt = false
 
+# Approximate (IP-based) location for the clinic page. Called with fetch() from the
+# public site before any sign-in, so it cannot carry a JWT.
+[functions.detect-location]
+verify_jwt = false
+
 [analytics]
 enabled = true
 port = 54327
